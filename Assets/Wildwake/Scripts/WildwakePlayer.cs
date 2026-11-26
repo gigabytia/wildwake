@@ -26,6 +26,7 @@ namespace Wildwake
         [SerializeField] private CharacterController controller;
         [SerializeField] private Transform viewCamera;
         [SerializeField] private Transform groundWeapon;
+        [SerializeField] private Transform weaponGrip;
         [SerializeField] private LayerMask groundLayers = ~0;
 
         [Header("Movement")]
@@ -232,15 +233,25 @@ namespace Wildwake
                 gripAxis = rightHand.up;
             }
 
-            float bladeLength = Mathf.Abs(groundWeapon.lossyScale.y);
             Vector3 grip = rightHand.position + palmDirection * 0.045f;
-            Vector3 bladeCenter = grip + gripAxis * Mathf.Max(0f, bladeLength * 0.5f - 0.14f);
             foreach (Collider weaponCollider in groundWeapon.GetComponentsInChildren<Collider>())
             {
                 weaponCollider.enabled = false;
             }
 
-            groundWeapon.SetPositionAndRotation(bladeCenter, Quaternion.LookRotation(bladeFace, gripAxis));
+            Quaternion gripRotation = Quaternion.LookRotation(bladeFace, gripAxis);
+            if (weaponGrip != null)
+            {
+                Quaternion localGripRotation = Quaternion.Inverse(groundWeapon.rotation) * weaponGrip.rotation;
+                groundWeapon.rotation = gripRotation * Quaternion.Inverse(localGripRotation);
+                groundWeapon.position += grip - weaponGrip.position;
+            }
+            else
+            {
+                float bladeLength = Mathf.Abs(groundWeapon.lossyScale.y);
+                Vector3 bladeCenter = grip + gripAxis * Mathf.Max(0f, bladeLength * 0.5f - 0.14f);
+                groundWeapon.SetPositionAndRotation(bladeCenter, gripRotation);
+            }
             groundWeapon.SetParent(rightHand, true);
             HasWeapon = true;
             animator.SetBool(ArmedParameter, true);
@@ -507,43 +518,68 @@ namespace Wildwake
 
             Vector3 animatedPosition = animator.GetIKPosition(foot);
             Quaternion animatedRotation = animator.GetIKRotation(foot);
-            Vector3 soleOffset = Vector3.down * soleHeight;
-            Vector3 animatedSole = animatedPosition + animatedRotation * soleOffset;
-            int count = Physics.RaycastNonAlloc(animatedSole + Vector3.up * .35f, Vector3.down, groundHits, .8f,
-                groundLayers, QueryTriggerInteraction.Ignore);
-            RaycastHit ground = default;
-            float closest = float.PositiveInfinity;
-            for (int index = 0; index < count; index++)
-            {
-                RaycastHit hit = groundHits[index];
-                if (hit.distance < closest && hit.normal.y > 0.55f && !hit.transform.IsChildOf(Body))
-                {
-                    ground = hit;
-                    closest = hit.distance;
-                }
-            }
-
-            if (ground.collider == null)
+            Vector3 heelOffset = soleHeight * new Vector3(0f, -1f, -.42f);
+            Vector3 toeOffset = soleHeight * new Vector3(0f, -1f, .88f);
+            Vector3 heel = animatedPosition + animatedRotation * heelOffset;
+            Vector3 toe = animatedPosition + animatedRotation * toeOffset;
+            RaycastHit heelGround = FindFootGround(heel);
+            RaycastHit toeGround = FindFootGround(toe);
+            bool heelSupported = heelGround.collider != null;
+            bool toeSupported = toeGround.collider != null;
+            if (!heelSupported && !toeSupported)
             {
                 animator.SetIKPositionWeight(foot, 0f);
                 animator.SetIKRotationWeight(foot, 0f);
                 return;
             }
 
-            float clearance = animatedSole.y - ground.point.y;
-            float stepContact = 1f - Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(.018f, .13f, clearance));
-            float weight = Mathf.Max(stepContact, idleContact);
-            Vector3 heading = Vector3.ProjectOnPlane(animatedRotation * Vector3.forward, ground.normal);
+            RaycastHit heelPlane = heelSupported ? heelGround : toeGround;
+            RaycastHit toePlane = toeSupported ? toeGround : heelGround;
+            float heelClearance = GroundClearance(heel, heelPlane);
+            float toeClearance = GroundClearance(toe, toePlane);
+
+            // A low heel is the weight-bearing phase. As it rises, let the clip roll onto the toe.
+            float plant = 1f - Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(.04f, .105f, heelClearance));
+            float soleContact = 1f - Mathf.SmoothStep(0f, 1f,
+                Mathf.InverseLerp(.024f, .085f, Mathf.Min(heelClearance, toeClearance)));
+            float rotationWeight = Mathf.Max(plant, idleContact);
+            float positionWeight = Mathf.Max(soleContact, rotationWeight);
+            Vector3 normal = (heelPlane.normal + toePlane.normal).normalized;
+            Vector3 heading = Vector3.ProjectOnPlane(animatedRotation * Vector3.forward, normal);
             if (heading.sqrMagnitude < .001f)
-                heading = Vector3.ProjectOnPlane(Body.forward, ground.normal);
-            Quaternion aligned = Quaternion.LookRotation(heading, ground.normal);
-            float rotationWeight = Mathf.Lerp(.6f * stepContact, 1f, idleContact);
-            Vector3 contactOffset = Quaternion.Slerp(animatedRotation, aligned, rotationWeight) * soleOffset;
-            float correction = Mathf.Clamp(ground.point.y + .007f - animatedPosition.y - contactOffset.y, -.12f, .12f);
+                heading = Vector3.ProjectOnPlane(Body.forward, normal);
+            Quaternion aligned = Quaternion.LookRotation(heading, normal);
+            Quaternion contactRotation = Quaternion.Slerp(animatedRotation, aligned, rotationWeight);
+            float lowestClearance = Mathf.Min(GroundClearance(animatedPosition + contactRotation * heelOffset, heelPlane),
+                GroundClearance(animatedPosition + contactRotation * toeOffset, toePlane));
+            float correction = Mathf.Clamp(.007f - lowestClearance, -.12f, .12f);
             animator.SetIKPosition(foot, animatedPosition + Vector3.up * correction);
             animator.SetIKRotation(foot, aligned);
-            animator.SetIKPositionWeight(foot, weight);
+            animator.SetIKPositionWeight(foot, positionWeight);
             animator.SetIKRotationWeight(foot, rotationWeight);
+        }
+
+        private RaycastHit FindFootGround(Vector3 point)
+        {
+            int count = Physics.RaycastNonAlloc(point + Vector3.up * .35f, Vector3.down, groundHits, .8f,
+                groundLayers, QueryTriggerInteraction.Ignore);
+            RaycastHit ground = default;
+            float closest = float.PositiveInfinity;
+            for (int index = 0; index < count; index++)
+            {
+                RaycastHit hit = groundHits[index];
+                if (hit.distance < closest && hit.normal.y > .55f && !hit.transform.IsChildOf(Body))
+                {
+                    ground = hit;
+                    closest = hit.distance;
+                }
+            }
+            return ground;
+        }
+
+        private static float GroundClearance(Vector3 position, RaycastHit ground)
+        {
+            return Vector3.Dot(position - ground.point, ground.normal) / ground.normal.y;
         }
     }
 }
